@@ -1,0 +1,21 @@
+{
+  "name": "mehrob-mania-backend",
+  "version": "1.0.0",
+  "description": "Backend server for the Mehrob Mania fantasy football site — handles Yahoo OAuth and serves league data.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
+    "cors": "^2.8.5",
+    "node-cache": "^5.1.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
