@@ -21,27 +21,60 @@ const LEAGUE_ID = process.env.YAHOO_LEAGUE_ID; // e.g. 4374
 const cache = new NodeCache({ stdTTL: 300 });
 
 // --- Token storage ---
-// For now, tokens are stored in a local JSON file since this app only
-// ever needs ONE Yahoo login (yours, as commissioner) — not per-visitor.
-// Once we're on real hosting, this should move to a proper database so
-// tokens survive server restarts/redeploys, but this gets us moving.
+// Render's free tier wipes local disk on every restart/redeploy, so we
+// can't rely on a file alone to remember the Yahoo connection. Instead:
+// the REFRESH token (which Yahoo issues once and rarely changes) gets
+// saved as a Render environment variable (YAHOO_REFRESH_TOKEN) by hand,
+// and the server uses that to silently re-authenticate on every boot.
 const TOKEN_FILE = path.join(__dirname, 'tokens.json');
+let inMemoryTokens = null;
 
 function saveTokens(tokens) {
-  fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokens, null, 2));
+  inMemoryTokens = tokens;
+  try {
+    fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokens, null, 2));
+  } catch (e) {
+    // Fine if this fails — inMemoryTokens is the real cache now.
+  }
 }
 
 function loadTokens() {
-  if (!fs.existsSync(TOKEN_FILE)) return null;
-  return JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf-8'));
+  if (inMemoryTokens) return inMemoryTokens;
+  if (fs.existsSync(TOKEN_FILE)) {
+    inMemoryTokens = JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf-8'));
+    return inMemoryTokens;
+  }
+  return null;
+}
+
+async function refreshWithToken(refreshToken) {
+  const refreshRes = await axios.post(
+    'https://api.login.yahoo.com/oauth2/get_token',
+    new URLSearchParams({
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      redirect_uri: REDIRECT_URI,
+      refresh_token: refreshToken,
+      grant_type: 'refresh_token',
+    }),
+    { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+  );
+  const newTokens = {
+    access_token: refreshRes.data.access_token,
+    refresh_token: refreshRes.data.refresh_token || refreshToken,
+    obtained_at: Date.now(),
+    expires_in: refreshRes.data.expires_in,
+  };
+  saveTokens(newTokens);
+  return newTokens;
 }
 
 // --- Step 1: Kick off Yahoo login ---
-// Visiting this URL in a browser sends the commissioner to Yahoo's
-// consent screen. Only needs to be done once (or again if the refresh
-// token ever stops working).
+// scope=fspt-r is required to actually get Fantasy Sports read access —
+// without it, Yahoo issues a token that can log you in but gets
+// rejected by the Fantasy API with "additional_authorization_required".
 app.get('/auth/yahoo', (req, res) => {
-  const authUrl = `https://api.login.yahoo.com/oauth2/request_auth?client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&response_type=code&language=en-us`;
+  const authUrl = `https://api.login.yahoo.com/oauth2/request_auth?client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&response_type=code&language=en-us&scope=fspt-r`;
   res.redirect(authUrl);
 });
 
@@ -71,43 +104,44 @@ app.get('/auth/yahoo/callback', async (req, res) => {
     };
     saveTokens(tokens);
 
-    res.send('Yahoo connected successfully! You can close this tab and go back to the app.');
+    res.send(`
+      <div style="font-family: sans-serif; max-width: 600px; margin: 40px auto; line-height: 1.6;">
+        <h2>&#9989; Yahoo connected successfully!</h2>
+        <p><strong>One-time setup step:</strong> to make this survive server restarts, copy the value below
+        and add it as an environment variable in Render named <code>YAHOO_REFRESH_TOKEN</code>.</p>
+        <p>Go to your Render dashboard &rarr; this service &rarr; Environment &rarr; Add Environment Variable.</p>
+        <div style="background:#f4f4f4; padding:12px; border-radius:6px; word-break:break-all; font-family:monospace; font-size:13px;">
+          ${tokens.refresh_token}
+        </div>
+        <p style="margin-top:20px; color:#666; font-size:14px;">Once you save that in Render, this connection will survive redeploys automatically &mdash; you won't need to do this again.</p>
+      </div>
+    `);
   } catch (err) {
     console.error('Token exchange failed:', err.response?.data || err.message);
     res.status(500).send('Something went wrong connecting to Yahoo. Check server logs.');
   }
 });
 
-// --- Refresh the access token when it's expired ---
+// --- Get a valid access token, bootstrapping from the durable
+// YAHOO_REFRESH_TOKEN env var if we have nothing in memory/file yet ---
 async function getValidAccessToken() {
-  const tokens = loadTokens();
-  if (!tokens) throw new Error('Yahoo is not connected yet. Visit /auth/yahoo first.');
+  let tokens = loadTokens();
+
+  if (!tokens && process.env.YAHOO_REFRESH_TOKEN) {
+    tokens = await refreshWithToken(process.env.YAHOO_REFRESH_TOKEN);
+  }
+
+  if (!tokens) {
+    throw new Error('Yahoo is not connected yet. Visit /auth/yahoo first.');
+  }
 
   const ageSeconds = (Date.now() - tokens.obtained_at) / 1000;
   const isExpired = ageSeconds > tokens.expires_in - 60; // refresh a bit early
 
   if (!isExpired) return tokens.access_token;
 
-  const refreshRes = await axios.post(
-    'https://api.login.yahoo.com/oauth2/get_token',
-    new URLSearchParams({
-      client_id: CLIENT_ID,
-      client_secret: CLIENT_SECRET,
-      redirect_uri: REDIRECT_URI,
-      refresh_token: tokens.refresh_token,
-      grant_type: 'refresh_token',
-    }),
-    { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
-  );
-
-  const newTokens = {
-    access_token: refreshRes.data.access_token,
-    refresh_token: refreshRes.data.refresh_token || tokens.refresh_token,
-    obtained_at: Date.now(),
-    expires_in: refreshRes.data.expires_in,
-  };
-  saveTokens(newTokens);
-  return newTokens.access_token;
+  const refreshed = await refreshWithToken(tokens.refresh_token);
+  return refreshed.access_token;
 }
 
 // --- Helper: call the Yahoo Fantasy Sports API ---
@@ -121,16 +155,27 @@ async function yahooGet(endpoint) {
 }
 
 // --- Status check: is Yahoo connected? ---
-app.get('/api/status', (req, res) => {
-  const tokens = loadTokens();
-  res.json({ connected: !!tokens });
+app.get('/api/status', async (req, res) => {
+  try {
+    await getValidAccessToken();
+    res.json({ connected: true });
+  } catch {
+    res.json({ connected: false });
+  }
+});
+
+// --- One-time helper: look up this season's NFL "game key" ---
+app.get('/api/gamekey', async (req, res) => {
+  try {
+    const data = await yahooGet('game/nfl');
+    res.json(data);
+  } catch (err) {
+    console.error('Game key lookup failed:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Failed to look up game key. Make sure /auth/yahoo has been completed.' });
+  }
 });
 
 // --- Standings endpoint ---
-// Note: Yahoo requires a full "league key" like "461.l.4374", where the
-// number prefix is the game key for a specific NFL season (it changes
-// every year). YAHOO_GAME_KEY should be set in .env — see README for
-// how to look it up.
 app.get('/api/standings', async (req, res) => {
   const cacheKey = 'standings';
   const cached = cache.get(cacheKey);
