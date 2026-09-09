@@ -13,19 +13,11 @@ app.use(express.json());
 const PORT = process.env.PORT || 3001;
 const CLIENT_ID = process.env.YAHOO_CLIENT_ID;
 const CLIENT_SECRET = process.env.YAHOO_CLIENT_SECRET;
-const REDIRECT_URI = process.env.YAHOO_REDIRECT_URI; // must exactly match what's registered on Yahoo
-const LEAGUE_ID = process.env.YAHOO_LEAGUE_ID; // e.g. 4374
+const REDIRECT_URI = process.env.YAHOO_REDIRECT_URI;
+const LEAGUE_ID = process.env.YAHOO_LEAGUE_ID;
 
-// Cache Yahoo responses for 5 minutes so we don't hammer their API
-// or blow through rate limits every time someone loads the site.
 const cache = new NodeCache({ stdTTL: 300 });
 
-// --- Token storage ---
-// Render's free tier wipes local disk on every restart/redeploy, so we
-// can't rely on a file alone to remember the Yahoo connection. Instead:
-// the REFRESH token (which Yahoo issues once and rarely changes) gets
-// saved as a Render environment variable (YAHOO_REFRESH_TOKEN) by hand,
-// and the server uses that to silently re-authenticate on every boot.
 const TOKEN_FILE = path.join(__dirname, 'tokens.json');
 let inMemoryTokens = null;
 
@@ -33,9 +25,7 @@ function saveTokens(tokens) {
   inMemoryTokens = tokens;
   try {
     fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokens, null, 2));
-  } catch (e) {
-    // Fine if this fails — inMemoryTokens is the real cache now.
-  }
+  } catch (e) {}
 }
 
 function loadTokens() {
@@ -69,16 +59,11 @@ async function refreshWithToken(refreshToken) {
   return newTokens;
 }
 
-// --- Step 1: Kick off Yahoo login ---
-// scope=fspt-r is required to actually get Fantasy Sports read access —
-// without it, Yahoo issues a token that can log you in but gets
-// rejected by the Fantasy API with "additional_authorization_required".
 app.get('/auth/yahoo', (req, res) => {
   const authUrl = `https://api.login.yahoo.com/oauth2/request_auth?client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&response_type=code&language=en-us&scope=fspt-r`;
   res.redirect(authUrl);
 });
 
-// --- Step 2: Yahoo redirects back here with a ?code=... ---
 app.get('/auth/yahoo/callback', async (req, res) => {
   const { code } = req.query;
   if (!code) return res.status(400).send('Missing authorization code from Yahoo.');
@@ -122,8 +107,6 @@ app.get('/auth/yahoo/callback', async (req, res) => {
   }
 });
 
-// --- Get a valid access token, bootstrapping from the durable
-// YAHOO_REFRESH_TOKEN env var if we have nothing in memory/file yet ---
 async function getValidAccessToken() {
   let tokens = loadTokens();
 
@@ -136,7 +119,7 @@ async function getValidAccessToken() {
   }
 
   const ageSeconds = (Date.now() - tokens.obtained_at) / 1000;
-  const isExpired = ageSeconds > tokens.expires_in - 60; // refresh a bit early
+  const isExpired = ageSeconds > tokens.expires_in - 60;
 
   if (!isExpired) return tokens.access_token;
 
@@ -144,7 +127,6 @@ async function getValidAccessToken() {
   return refreshed.access_token;
 }
 
-// --- Helper: call the Yahoo Fantasy Sports API ---
 async function yahooGet(endpoint) {
   const accessToken = await getValidAccessToken();
   const url = `https://fantasysports.yahooapis.com/fantasy/v2/${endpoint}?format=json`;
@@ -154,7 +136,6 @@ async function yahooGet(endpoint) {
   return response.data;
 }
 
-// --- Status check: is Yahoo connected? ---
 app.get('/api/status', async (req, res) => {
   try {
     await getValidAccessToken();
@@ -164,7 +145,6 @@ app.get('/api/status', async (req, res) => {
   }
 });
 
-// --- One-time helper: look up this season's NFL "game key" ---
 app.get('/api/gamekey', async (req, res) => {
   try {
     const data = await yahooGet('game/nfl');
@@ -175,7 +155,6 @@ app.get('/api/gamekey', async (req, res) => {
   }
 });
 
-// --- Standings endpoint ---
 app.get('/api/standings', async (req, res) => {
   const cacheKey = 'standings';
   const cached = cache.get(cacheKey);
@@ -190,6 +169,77 @@ app.get('/api/standings', async (req, res) => {
   } catch (err) {
     console.error('Standings fetch failed:', err.response?.data || err.message);
     res.status(500).json({ error: 'Failed to fetch standings from Yahoo.' });
+  }
+});
+
+app.get('/api/settings', async (req, res) => {
+  const cacheKey = 'settings';
+  const cached = cache.get(cacheKey);
+  if (cached) return res.json(cached);
+
+  try {
+    const gameKey = process.env.YAHOO_GAME_KEY;
+    const leagueKey = `${gameKey}.l.${LEAGUE_ID}`;
+    const data = await yahooGet(`league/${leagueKey}/settings`);
+    cache.set(cacheKey, data);
+    res.json(data);
+  } catch (err) {
+    console.error('Settings fetch failed:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Failed to fetch league settings from Yahoo.' });
+  }
+});
+
+app.get('/api/schedule', async (req, res) => {
+  const week = req.query.week || '1';
+  const cacheKey = `schedule-${week}`;
+  const cached = cache.get(cacheKey);
+  if (cached) return res.json(cached);
+
+  try {
+    const gameKey = process.env.YAHOO_GAME_KEY;
+    const leagueKey = `${gameKey}.l.${LEAGUE_ID}`;
+    const data = await yahooGet(`league/${leagueKey}/scoreboard;week=${week}`);
+    cache.set(cacheKey, data);
+    res.json(data);
+  } catch (err) {
+    console.error('Schedule fetch failed:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Failed to fetch schedule from Yahoo.' });
+  }
+});
+
+// --- Draft results: every pick, every team, for the current season ---
+app.get('/api/draft', async (req, res) => {
+  const cacheKey = 'draft';
+  const cached = cache.get(cacheKey);
+  if (cached) return res.json(cached);
+
+  try {
+    const gameKey = process.env.YAHOO_GAME_KEY;
+    const leagueKey = `${gameKey}.l.${LEAGUE_ID}`;
+    const data = await yahooGet(`league/${leagueKey}/draftresults`);
+    cache.set(cacheKey, data);
+    res.json(data);
+  } catch (err) {
+    console.error('Draft results fetch failed:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Failed to fetch draft results from Yahoo.' });
+  }
+});
+
+// --- Transactions: adds, drops, trades, FAAB history ---
+app.get('/api/transactions', async (req, res) => {
+  const cacheKey = 'transactions';
+  const cached = cache.get(cacheKey);
+  if (cached) return res.json(cached);
+
+  try {
+    const gameKey = process.env.YAHOO_GAME_KEY;
+    const leagueKey = `${gameKey}.l.${LEAGUE_ID}`;
+    const data = await yahooGet(`league/${leagueKey}/transactions`);
+    cache.set(cacheKey, data);
+    res.json(data);
+  } catch (err) {
+    console.error('Transactions fetch failed:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Failed to fetch transactions from Yahoo.' });
   }
 });
 
