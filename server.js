@@ -136,16 +136,6 @@ async function yahooGet(endpoint) {
   return response.data;
 }
 
-// Yahoo's arrays mix real data objects with empty-array placeholders —
-// this merges all the real objects in an array into one flat lookup.
-function flattenMeta(arr) {
-  const result = {};
-  arr.forEach((item) => {
-    if (!Array.isArray(item)) Object.assign(result, item);
-  });
-  return result;
-}
-
 app.get('/api/status', async (req, res) => {
   try {
     await getValidAccessToken();
@@ -217,10 +207,6 @@ app.get('/api/schedule', async (req, res) => {
   }
 });
 
-// --- Draft results, WITH real player names resolved ---
-// Yahoo's draft results only give player IDs (e.g. "470.p.40055"), so
-// this makes a second batched call to look up actual names and merges
-// them in as a `playerNames` map keyed by player_key.
 app.get('/api/draft', async (req, res) => {
   const cacheKey = 'draft';
   const cached = cache.get(cacheKey);
@@ -259,7 +245,6 @@ app.get('/api/draft', async (req, res) => {
   }
 });
 
-// --- Transactions: adds, drops, trades, FAAB history ---
 app.get('/api/transactions', async (req, res) => {
   const cacheKey = 'transactions';
   const cached = cache.get(cacheKey);
@@ -274,6 +259,58 @@ app.get('/api/transactions', async (req, res) => {
   } catch (err) {
     console.error('Transactions fetch failed:', err.response?.data || err.message);
     res.status(500).json({ error: 'Failed to fetch transactions from Yahoo.' });
+  }
+});
+
+// Yahoo's arrays mix real data objects with empty-array placeholders —
+// this merges all the real objects in an array into one flat lookup.
+function flattenMeta(arr) {
+  const result = {};
+  arr.forEach((item) => {
+    if (!Array.isArray(item)) Object.assign(result, item);
+  });
+  return result;
+}
+
+// --- League history: walks Yahoo's "renew" chain backward through every
+// past season automatically, pulling each one's real final standings
+// (which include real final rank for completed seasons — champion,
+// runner-up, etc. — no manual entry needed). ---
+app.get('/api/history', async (req, res) => {
+  const cacheKey = 'history';
+  const cached = cache.get(cacheKey);
+  if (cached) return res.json(cached);
+
+  try {
+    const seasons = [];
+    let currentKey = `${process.env.YAHOO_GAME_KEY}.l.${LEAGUE_ID}`;
+    let safety = 0;
+
+    while (currentKey && safety < 15) {
+      safety++;
+      const standingsData = await yahooGet(`league/${currentKey}/standings`);
+      const leagueMeta = standingsData?.fantasy_content?.league?.[0];
+      if (!leagueMeta) break;
+
+      seasons.push({
+        season: leagueMeta.season,
+        league_key: currentKey,
+        league_name: leagueMeta.name,
+        standings: standingsData,
+      });
+
+      const renew = leagueMeta.renew; // format like "461_45789" (prior game_key underscore prior league_id)
+      if (!renew) break;
+      const [prevGameKey, prevLeagueId] = renew.split('_');
+      if (!prevGameKey || !prevLeagueId) break;
+      currentKey = `${prevGameKey}.l.${prevLeagueId}`;
+    }
+
+    cache.set(cacheKey, seasons, 3600); // history changes rarely, cache an hour
+    res.json(seasons);
+  } catch (err) {
+    console.error('History fetch failed:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Failed to fetch league history from Yahoo.' });
   }
 });
 
