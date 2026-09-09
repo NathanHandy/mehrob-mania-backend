@@ -136,6 +136,16 @@ async function yahooGet(endpoint) {
   return response.data;
 }
 
+// Yahoo's arrays mix real data objects with empty-array placeholders —
+// this merges all the real objects in an array into one flat lookup.
+function flattenMeta(arr) {
+  const result = {};
+  arr.forEach((item) => {
+    if (!Array.isArray(item)) Object.assign(result, item);
+  });
+  return result;
+}
+
 app.get('/api/status', async (req, res) => {
   try {
     await getValidAccessToken();
@@ -207,7 +217,10 @@ app.get('/api/schedule', async (req, res) => {
   }
 });
 
-// --- Draft results: every pick, every team, for the current season ---
+// --- Draft results, WITH real player names resolved ---
+// Yahoo's draft results only give player IDs (e.g. "470.p.40055"), so
+// this makes a second batched call to look up actual names and merges
+// them in as a `playerNames` map keyed by player_key.
 app.get('/api/draft', async (req, res) => {
   const cacheKey = 'draft';
   const cached = cache.get(cacheKey);
@@ -216,9 +229,30 @@ app.get('/api/draft', async (req, res) => {
   try {
     const gameKey = process.env.YAHOO_GAME_KEY;
     const leagueKey = `${gameKey}.l.${LEAGUE_ID}`;
-    const data = await yahooGet(`league/${leagueKey}/draftresults`);
-    cache.set(cacheKey, data);
-    res.json(data);
+    const draftData = await yahooGet(`league/${leagueKey}/draftresults`);
+
+    const resultsObj = draftData?.fantasy_content?.league?.[1]?.draft_results || {};
+    const playerKeys = Object.keys(resultsObj)
+      .filter((k) => k !== 'count')
+      .map((k) => resultsObj[k].draft_result.player_key);
+
+    const playerNames = {};
+    for (let i = 0; i < playerKeys.length; i += 25) {
+      const chunk = playerKeys.slice(i, i + 25);
+      const playersData = await yahooGet(`league/${leagueKey}/players;player_keys=${chunk.join(',')}`);
+      const playersObj = playersData?.fantasy_content?.league?.[1]?.players || {};
+      Object.keys(playersObj).forEach((k) => {
+        if (k === 'count') return;
+        const meta = flattenMeta(playersObj[k].player[0]);
+        if (meta.player_key) {
+          playerNames[meta.player_key] = meta.name?.full || meta.editorial_team_abbr || 'Unknown Player';
+        }
+      });
+    }
+
+    const enriched = { ...draftData, playerNames };
+    cache.set(cacheKey, enriched);
+    res.json(enriched);
   } catch (err) {
     console.error('Draft results fetch failed:', err.response?.data || err.message);
     res.status(500).json({ error: 'Failed to fetch draft results from Yahoo.' });
