@@ -377,7 +377,14 @@ app.get('/api/season-detail', async (req, res) => {
       // Draft results might not exist/be accessible for very old leagues — that's fine, standings still work.
     }
 
-    const result = { league_key: leagueKey, standings, draft };
+    let transactions = null;
+    try {
+      transactions = await yahooGet(`league/${leagueKey}/transactions`);
+    } catch (e) {
+      // Same deal — transactions might not be pullable for very old leagues.
+    }
+
+    const result = { league_key: leagueKey, standings, draft, transactions };
     cache.set(cacheKey, result, 3600);
     res.json(result);
   } catch (err) {
