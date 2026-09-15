@@ -393,6 +393,251 @@ app.get('/api/season-detail', async (req, res) => {
   }
 });
 
+// --- Every weekly matchup, every season (2022\u20132026) ---
+// This is the foundation for real Head-to-Head records, Team Points
+// records, Fun facts, and the What-If schedule-swap simulator. Pulls one
+// scoreboard call per week of every season (~85 calls total), so the
+// first request after a cache miss can take a while \u2014 it's cached
+// heavily afterward since historical seasons never change.
+const ALL_SCORES_SEASONS = [
+  { season: 2026, league_key: () => `${process.env.YAHOO_GAME_KEY}.l.${LEAGUE_ID}` },
+  { season: 2025, league_key: () => '461.l.45789' },
+  { season: 2024, league_key: () => '449.l.20860' },
+  { season: 2023, league_key: () => '423.l.1146108' },
+  { season: 2022, league_id: '1171203' },
+];
+
+async function resolveGameKeyForSeason(season) {
+  const gameData = await yahooGet(`games;game_codes=nfl;seasons=${season}`);
+  const gamesObj = gameData?.fantasy_content?.games || {};
+  const gameKeyEntry = Object.keys(gamesObj).find((k) => k !== 'count');
+  if (!gameKeyEntry) return null;
+  const gameEntry = gamesObj[gameKeyEntry].game;
+  if (Array.isArray(gameEntry)) {
+    const meta = Array.isArray(gameEntry[0]) ? flattenMeta(gameEntry[0]) : flattenMeta(gameEntry);
+    return meta.game_key || null;
+  } else if (gameEntry && typeof gameEntry === 'object') {
+    return gameEntry.game_key || null;
+  }
+  return null;
+}
+
+async function computeAllScores() {
+  const allMatchups = [];
+
+  for (const s of ALL_SCORES_SEASONS) {
+    let leagueKey;
+    try {
+      leagueKey = s.league_key ? s.league_key() : null;
+      if (!leagueKey) {
+        const gameKey = await resolveGameKeyForSeason(s.season);
+        if (!gameKey) continue;
+        leagueKey = `${gameKey}.l.${s.league_id}`;
+      }
+    } catch (e) { continue; }
+
+    let maxWeek = 17;
+    try {
+      const standingsData = await yahooGet(`league/${leagueKey}/standings`);
+      const leagueMeta = standingsData?.fantasy_content?.league?.[0];
+      if (leagueMeta) {
+        maxWeek = Number(leagueMeta.is_finished ? (leagueMeta.end_week || 17) : (leagueMeta.current_week || 1));
+      }
+    } catch (e) { /* fall back to 17 */ }
+
+    for (let week = 1; week <= maxWeek; week++) {
+      try {
+        const data = await yahooGet(`league/${leagueKey}/scoreboard;week=${week}`);
+        const matchupsObj = data?.fantasy_content?.league?.[1]?.scoreboard?.[0]?.matchups;
+        if (!matchupsObj) continue;
+        Object.keys(matchupsObj).forEach((key) => {
+          if (key === 'count') return;
+          const teamsObj = matchupsObj[key].matchup[0]?.teams;
+          if (!teamsObj) return;
+          const t0 = teamsObj['0']?.team;
+          const t1 = teamsObj['1']?.team;
+          if (!t0 || !t1) return;
+          const meta0 = flattenMeta(t0[0]);
+          const meta1 = flattenMeta(t1[0]);
+          const pts0 = Number(t0[1]?.team_points?.total) || 0;
+          const pts1 = Number(t1[1]?.team_points?.total) || 0;
+          if (pts0 === 0 && pts1 === 0) return; // not played yet
+          allMatchups.push({
+            season: s.season,
+            week,
+            teamA: { id: meta0.team_id, name: meta0.name, nickname: meta0.managers?.[0]?.manager?.nickname, points: pts0 },
+            teamB: { id: meta1.team_id, name: meta1.name, nickname: meta1.managers?.[0]?.manager?.nickname, points: pts1 },
+          });
+        });
+      } catch (e) { /* this week might not exist \u2014 skip it */ }
+    }
+  }
+
+  return allMatchups;
+}
+
+let allScoresPromise = null;
+app.get('/api/all-scores', async (req, res) => {
+  const cacheKey = 'all-scores';
+  const cached = cache.get(cacheKey);
+  if (cached) return res.json(cached);
+
+  try {
+    if (!allScoresPromise) {
+      allScoresPromise = computeAllScores().finally(() => { allScoresPromise = null; });
+    }
+    const allMatchups = await allScoresPromise;
+    cache.set(cacheKey, allMatchups, 21600); // 6 hours \u2014 this is expensive to compute
+    res.json(allMatchups);
+  } catch (err) {
+    console.error('All-scores fetch failed:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Failed to fetch all-time scores from Yahoo.' });
+  }
+});
+
+// --- Player-level stats (Team Stats: TDs, yards, FGs) ---
+// This is a MUCH bigger pull than everything else combined: for every
+// week of every season, every team's roster, every rostered player's
+// individual stat line. Realistically ~2,000+ Yahoo API calls, so this
+// runs as a background job (fire-and-forget, in-memory progress) rather
+// than inside a single request \u2014 the frontend polls for progress.
+let playerStatsJob = { status: 'idle', progress: 0, total: 0, data: null, error: null };
+
+async function runPlayerStatsJob() {
+  playerStatsJob = { status: 'computing', progress: 0, total: 0, data: null, error: null };
+  try {
+    const seasonMeta = [];
+    for (const s of ALL_SCORES_SEASONS) {
+      let leagueKey;
+      try {
+        leagueKey = s.league_key ? s.league_key() : null;
+        if (!leagueKey) {
+          const gameKey = await resolveGameKeyForSeason(s.season);
+          if (!gameKey) continue;
+          leagueKey = `${gameKey}.l.${s.league_id}`;
+        }
+      } catch (e) { continue; }
+
+      let maxWeek = 17;
+      try {
+        const standingsData = await yahooGet(`league/${leagueKey}/standings`);
+        const leagueMeta = standingsData?.fantasy_content?.league?.[0];
+        if (leagueMeta) maxWeek = Number(leagueMeta.is_finished ? (leagueMeta.end_week || 17) : (leagueMeta.current_week || 1));
+      } catch (e) { /* fall back to 17 */ }
+
+      let statIdToName = {};
+      try {
+        const settingsData = await yahooGet(`league/${leagueKey}/settings`);
+        const statCats = settingsData?.fantasy_content?.league?.[1]?.settings?.[0]?.stat_categories?.stats || {};
+        Object.keys(statCats).forEach((k) => {
+          if (k === 'count') return;
+          const stat = statCats[k].stat;
+          if (stat?.stat_id) statIdToName[stat.stat_id] = stat.display_name || stat.name;
+        });
+      } catch (e) { /* stat names unavailable for this season \u2014 skip it */ }
+
+      seasonMeta.push({ season: s.season, leagueKey, maxWeek, statIdToName });
+    }
+
+    playerStatsJob.total = seasonMeta.reduce((sum, sm) => sum + sm.maxWeek * 12, 0);
+
+    const allPlayerWeeks = [];
+
+    for (const sm of seasonMeta) {
+      for (let week = 1; week <= sm.maxWeek; week++) {
+        let teams = [];
+        try {
+          const data = await yahooGet(`league/${sm.leagueKey}/scoreboard;week=${week}`);
+          const matchupsObj = data?.fantasy_content?.league?.[1]?.scoreboard?.[0]?.matchups;
+          if (matchupsObj) {
+            Object.keys(matchupsObj).forEach((key) => {
+              if (key === 'count') return;
+              const teamsObj = matchupsObj[key].matchup[0]?.teams;
+              if (!teamsObj) return;
+              ['0', '1'].forEach((idx) => {
+                const t = teamsObj[idx]?.team;
+                if (t) {
+                  const meta = flattenMeta(t[0]);
+                  const pts = Number(t[1]?.team_points?.total) || 0;
+                  if (pts > 0) teams.push({ team_key: meta.team_key, nickname: meta.managers?.[0]?.manager?.nickname, name: meta.name });
+                }
+              });
+            });
+          }
+        } catch (e) { continue; } // this week doesn't exist \u2014 skip
+
+        for (const tk of teams) {
+          try {
+            const rosterData = await yahooGet(`team/${tk.team_key}/roster;week=${week}`);
+            const playersObj = rosterData?.fantasy_content?.team?.[1]?.roster?.[0]?.players || {};
+            const playerKeys = [];
+            const posMap = {};
+            Object.keys(playersObj).forEach((pk) => {
+              if (pk === 'count') return;
+              const pArr = playersObj[pk].player;
+              const meta = flattenMeta(pArr[0]);
+              const posInfo = flattenMeta(Array.isArray(pArr[1]) ? pArr[1] : [pArr[1]]);
+              playerKeys.push(meta.player_key);
+              posMap[meta.player_key] = posInfo.selected_position?.position || 'BN';
+            });
+
+            for (let i = 0; i < playerKeys.length; i += 25) {
+              const chunk = playerKeys.slice(i, i + 25);
+              const statsData = await yahooGet(`league/${sm.leagueKey}/players;player_keys=${chunk.join(',')}/stats;type=week;week=${week}`);
+              const statsObj = statsData?.fantasy_content?.league?.[1]?.players || {};
+              Object.keys(statsObj).forEach((k) => {
+                if (k === 'count') return;
+                const pArr = statsObj[k].player;
+                const meta = flattenMeta(pArr[0]);
+                const statsBlock = pArr[1]?.player_stats?.stats || {};
+                const statLine = {};
+                Object.keys(statsBlock).forEach((sk) => {
+                  if (sk === 'count') return;
+                  const st = statsBlock[sk].stat;
+                  const name = sm.statIdToName[st.stat_id];
+                  if (name) statLine[name] = Number(st.value) || 0;
+                });
+                allPlayerWeeks.push({
+                  season: sm.season, week,
+                  teamNickname: tk.nickname, teamName: tk.name,
+                  position: posMap[meta.player_key] || 'BN',
+                  isStarter: (posMap[meta.player_key] || 'BN') !== 'BN',
+                  stats: statLine,
+                });
+              });
+            }
+          } catch (e) { /* skip this team-week on any error */ }
+          playerStatsJob.progress++;
+        }
+      }
+    }
+
+    playerStatsJob = { status: 'done', progress: playerStatsJob.total, total: playerStatsJob.total, data: allPlayerWeeks, error: null };
+  } catch (err) {
+    console.error('Player stats job failed:', err.response?.data || err.message);
+    playerStatsJob = { status: 'error', progress: playerStatsJob.progress, total: playerStatsJob.total, data: null, error: err.message };
+  }
+}
+
+app.get('/api/player-stats', (req, res) => {
+  if (playerStatsJob.status === 'idle') {
+    runPlayerStatsJob(); // fire-and-forget \u2014 runs in the background over several minutes
+    return res.json({ status: 'computing', progress: 0, total: 0 });
+  }
+  if (playerStatsJob.status === 'computing') {
+    return res.json({ status: 'computing', progress: playerStatsJob.progress, total: playerStatsJob.total });
+  }
+  if (playerStatsJob.status === 'error') {
+    return res.json({ status: 'error', error: playerStatsJob.error });
+  }
+  res.json({ status: 'done', data: playerStatsJob.data });
+});
+
+app.get('/api/player-stats/reset', (req, res) => {
+  playerStatsJob = { status: 'idle', progress: 0, total: 0, data: null, error: null };
+  res.json({ status: 'idle' });
+});
+
 app.get('/', (req, res) => {
   res.send('Mehrob Mania backend is running. Visit /auth/yahoo to connect Yahoo.');
 });
