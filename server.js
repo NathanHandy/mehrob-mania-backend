@@ -353,7 +353,18 @@ app.get('/api/season-detail', async (req, res) => {
       const gameData = await yahooGet(`games;game_codes=nfl;seasons=${season}`);
       const gamesObj = gameData?.fantasy_content?.games || {};
       const gameKeyEntry = Object.keys(gamesObj).find((k) => k !== 'count');
-      const gameKey = gameKeyEntry ? flattenMeta(gamesObj[gameKeyEntry].game[0] || gamesObj[gameKeyEntry].game).game_key : null;
+      let gameKey = null;
+      if (gameKeyEntry) {
+        const gameEntry = gamesObj[gameKeyEntry].game;
+        // Yahoo's shape here varies: could be a flat object, an array of
+        // mixed objects, or that array nested one level deeper.
+        if (Array.isArray(gameEntry)) {
+          const meta = Array.isArray(gameEntry[0]) ? flattenMeta(gameEntry[0]) : flattenMeta(gameEntry);
+          gameKey = meta.game_key || null;
+        } else if (gameEntry && typeof gameEntry === 'object') {
+          gameKey = gameEntry.game_key || null;
+        }
+      }
       if (!gameKey) return res.status(404).json({ error: `Couldn't resolve a game key for season ${season}.` });
       leagueKey = `${gameKey}.l.${league_id}`;
     }
