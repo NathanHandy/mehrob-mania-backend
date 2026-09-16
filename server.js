@@ -589,7 +589,13 @@ async function runPlayerStatsJob() {
                 if (k === 'count') return;
                 const pArr = statsObj[k].player;
                 const meta = flattenMeta(pArr[0]);
-                const statsBlock = pArr[1]?.player_stats?.stats || {};
+                let statsBlock = {};
+                let playerPoints = null;
+                pArr.forEach((el, idx) => {
+                  if (idx === 0) return; // meta array, already handled
+                  if (el?.player_stats?.stats) statsBlock = el.player_stats.stats;
+                  if (el?.player_points) playerPoints = Number(el.player_points.total) || 0;
+                });
                 const statLine = {};
                 Object.keys(statsBlock).forEach((sk) => {
                   if (sk === 'count') return;
@@ -600,8 +606,11 @@ async function runPlayerStatsJob() {
                 allPlayerWeeks.push({
                   season: sm.season, week,
                   teamNickname: tk.nickname, teamName: tk.name,
+                  playerKey: meta.player_key,
+                  playerName: meta.name?.full || null,
                   position: posMap[meta.player_key] || 'BN',
                   isStarter: (posMap[meta.player_key] || 'BN') !== 'BN',
+                  points: playerPoints,
                   stats: statLine,
                 });
               });
