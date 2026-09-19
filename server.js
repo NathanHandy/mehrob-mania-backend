@@ -399,18 +399,13 @@ app.get('/api/season-detail', async (req, res) => {
   }
 });
 
-// --- Every weekly matchup, every season (2022\u20132026) ---
-// This is the foundation for real Head-to-Head records, Team Points
-// records, Fun facts, and the What-If schedule-swap simulator. Pulls one
-// scoreboard call per week of every season (~85 calls total), so the
-// first request after a cache miss can take a while \u2014 it's cached
-// heavily afterward since historical seasons never change.
+// --- Every weekly matchup, current season only ---
+// 2022–2025 are now permanently frozen as static data in the frontend
+// (see /api/historical-snapshot, which was used to generate it) \u2014 so
+// this only needs to cover whatever season is still actually changing.
+// Update this list at the start of each new season.
 const ALL_SCORES_SEASONS = [
   { season: 2026, league_key: () => `${process.env.YAHOO_GAME_KEY}.l.${LEAGUE_ID}` },
-  { season: 2025, league_key: () => '461.l.45789' },
-  { season: 2024, league_key: () => '449.l.20860' },
-  { season: 2023, league_key: () => '423.l.1146108' },
-  { season: 2022, league_id: '1171203' },
 ];
 
 async function resolveGameKeyForSeason(season) {
