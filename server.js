@@ -136,6 +136,24 @@ async function yahooGet(endpoint) {
   return response.data;
 }
 
+// Retries with backoff, and a small pause even on success \u2014 used only in
+// the big player-stats job, which makes thousands of rapid calls and is
+// the one place we've seen Yahoo silently rate-limit and drop requests.
+async function yahooGetWithRetry(endpoint, retries = 3) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const result = await yahooGet(endpoint);
+      await new Promise((r) => setTimeout(r, 120));
+      return result;
+    } catch (e) {
+      if (attempt === retries) throw e;
+      const status = e.response?.status;
+      const backoff = status === 429 || status === 999 ? 2500 : 500;
+      await new Promise((r) => setTimeout(r, backoff * (attempt + 1)));
+    }
+  }
+}
+
 // Yahoo's arrays mix real data objects with empty-array placeholders —
 // this merges all the real objects in an array into one flat lookup.
 function flattenMeta(arr) {
@@ -337,6 +355,34 @@ app.get('/api/history', async (req, res) => {
 //   ?league_id=1171203&season=2022   (resolves the game_key for that
 //                                      season first, then builds the key
 //                                      \u2014 needed for older/unlinked leagues)
+async function fetchSeasonDetail({ league_key, league_id, season }) {
+  let leagueKey = league_key;
+
+  if (!leagueKey) {
+    if (!league_id || !season) throw new Error('Provide either league_key, or both league_id and season.');
+    const gameKey = await resolveGameKeyForSeason(season);
+    if (!gameKey) throw new Error(`Couldn't resolve a game key for season ${season}.`);
+    leagueKey = `${gameKey}.l.${league_id}`;
+  }
+
+  const standings = await yahooGet(`league/${leagueKey}/standings`);
+  let draft = null;
+  try {
+    draft = await fetchDraftWithNames(leagueKey);
+  } catch (e) {
+    // Draft results might not exist/be accessible for very old leagues — that's fine, standings still work.
+  }
+
+  let transactions = null;
+  try {
+    transactions = await yahooGet(`league/${leagueKey}/transactions`);
+  } catch (e) {
+    // Same deal — transactions might not be pullable for very old leagues.
+  }
+
+  return { league_key: leagueKey, standings, draft, transactions };
+}
+
 app.get('/api/season-detail', async (req, res) => {
   const { league_key, league_id, season } = req.query;
   const cacheKey = `season-detail-${league_key || `${league_id}-${season}`}`;
@@ -344,47 +390,7 @@ app.get('/api/season-detail', async (req, res) => {
   if (cached) return res.json(cached);
 
   try {
-    let leagueKey = league_key;
-
-    if (!leagueKey) {
-      if (!league_id || !season) {
-        return res.status(400).json({ error: 'Provide either league_key, or both league_id and season.' });
-      }
-      const gameData = await yahooGet(`games;game_codes=nfl;seasons=${season}`);
-      const gamesObj = gameData?.fantasy_content?.games || {};
-      const gameKeyEntry = Object.keys(gamesObj).find((k) => k !== 'count');
-      let gameKey = null;
-      if (gameKeyEntry) {
-        const gameEntry = gamesObj[gameKeyEntry].game;
-        // Yahoo's shape here varies: could be a flat object, an array of
-        // mixed objects, or that array nested one level deeper.
-        if (Array.isArray(gameEntry)) {
-          const meta = Array.isArray(gameEntry[0]) ? flattenMeta(gameEntry[0]) : flattenMeta(gameEntry);
-          gameKey = meta.game_key || null;
-        } else if (gameEntry && typeof gameEntry === 'object') {
-          gameKey = gameEntry.game_key || null;
-        }
-      }
-      if (!gameKey) return res.status(404).json({ error: `Couldn't resolve a game key for season ${season}.` });
-      leagueKey = `${gameKey}.l.${league_id}`;
-    }
-
-    const standings = await yahooGet(`league/${leagueKey}/standings`);
-    let draft = null;
-    try {
-      draft = await fetchDraftWithNames(leagueKey);
-    } catch (e) {
-      // Draft results might not exist/be accessible for very old leagues — that's fine, standings still work.
-    }
-
-    let transactions = null;
-    try {
-      transactions = await yahooGet(`league/${leagueKey}/transactions`);
-    } catch (e) {
-      // Same deal — transactions might not be pullable for very old leagues.
-    }
-
-    const result = { league_key: leagueKey, standings, draft, transactions };
+    const result = await fetchSeasonDetail({ league_key, league_id, season });
     cache.set(cacheKey, result, 3600);
     res.json(result);
   } catch (err) {
@@ -501,10 +507,10 @@ app.get('/api/all-scores', async (req, res) => {
 // individual stat line. Realistically ~2,000+ Yahoo API calls, so this
 // runs as a background job (fire-and-forget, in-memory progress) rather
 // than inside a single request \u2014 the frontend polls for progress.
-let playerStatsJob = { status: 'idle', progress: 0, total: 0, data: null, error: null };
+let playerStatsJob = { status: 'idle', progress: 0, total: 0, skipped: 0, data: null, error: null };
 
 async function runPlayerStatsJob() {
-  playerStatsJob = { status: 'computing', progress: 0, total: 0, data: null, error: null };
+  playerStatsJob = { status: 'computing', progress: 0, total: 0, skipped: 0, data: null, error: null };
   try {
     const seasonMeta = [];
     for (const s of ALL_SCORES_SEASONS) {
@@ -568,7 +574,7 @@ async function runPlayerStatsJob() {
 
         for (const tk of teams) {
           try {
-            const rosterData = await yahooGet(`team/${tk.team_key}/roster;week=${week}`);
+            const rosterData = await yahooGetWithRetry(`team/${tk.team_key}/roster;week=${week}`);
             const playersObj = rosterData?.fantasy_content?.team?.[1]?.roster?.[0]?.players || {};
             const playerKeys = [];
             const posMap = {};
@@ -583,7 +589,7 @@ async function runPlayerStatsJob() {
 
             for (let i = 0; i < playerKeys.length; i += 25) {
               const chunk = playerKeys.slice(i, i + 25);
-              const statsData = await yahooGet(`league/${sm.leagueKey}/players;player_keys=${chunk.join(',')}/stats;type=week;week=${week}`);
+              const statsData = await yahooGetWithRetry(`league/${sm.leagueKey}/players;player_keys=${chunk.join(',')}/stats;type=week;week=${week}`);
               const statsObj = statsData?.fantasy_content?.league?.[1]?.players || {};
               Object.keys(statsObj).forEach((k) => {
                 if (k === 'count') return;
@@ -615,36 +621,85 @@ async function runPlayerStatsJob() {
                 });
               });
             }
-          } catch (e) { /* skip this team-week on any error */ }
+          } catch (e) {
+            playerStatsJob.skipped++; // even after retries, this team-week couldn't be pulled
+          }
           playerStatsJob.progress++;
         }
       }
     }
 
-    playerStatsJob = { status: 'done', progress: playerStatsJob.total, total: playerStatsJob.total, data: allPlayerWeeks, error: null };
+    playerStatsJob = { status: 'done', progress: playerStatsJob.total, total: playerStatsJob.total, skipped: playerStatsJob.skipped, data: allPlayerWeeks, error: null };
   } catch (err) {
     console.error('Player stats job failed:', err.response?.data || err.message);
-    playerStatsJob = { status: 'error', progress: playerStatsJob.progress, total: playerStatsJob.total, data: null, error: err.message };
+    playerStatsJob = { status: 'error', progress: playerStatsJob.progress, total: playerStatsJob.total, skipped: playerStatsJob.skipped, data: null, error: err.message };
   }
 }
 
 app.get('/api/player-stats', (req, res) => {
   if (playerStatsJob.status === 'idle') {
     runPlayerStatsJob(); // fire-and-forget \u2014 runs in the background over several minutes
-    return res.json({ status: 'computing', progress: 0, total: 0 });
+    return res.json({ status: 'computing', progress: 0, total: 0, skipped: 0 });
   }
   if (playerStatsJob.status === 'computing') {
-    return res.json({ status: 'computing', progress: playerStatsJob.progress, total: playerStatsJob.total });
+    return res.json({ status: 'computing', progress: playerStatsJob.progress, total: playerStatsJob.total, skipped: playerStatsJob.skipped });
   }
   if (playerStatsJob.status === 'error') {
-    return res.json({ status: 'error', error: playerStatsJob.error });
+    return res.json({ status: 'error', error: playerStatsJob.error, skipped: playerStatsJob.skipped });
   }
-  res.json({ status: 'done', data: playerStatsJob.data });
+  res.json({ status: 'done', data: playerStatsJob.data, skipped: playerStatsJob.skipped });
 });
 
 app.get('/api/player-stats/reset', (req, res) => {
-  playerStatsJob = { status: 'idle', progress: 0, total: 0, data: null, error: null };
+  playerStatsJob = { status: 'idle', progress: 0, total: 0, skipped: 0, data: null, error: null };
   res.json({ status: 'idle' });
+});
+
+// --- Historical snapshot: everything for the permanently-frozen past
+// seasons, bundled into one downloadable file. Meant to be fetched once
+// (ideally right after a successful Team Stats run), saved, and baked
+// into the frontend as static data — so historical years never need a
+// live Yahoo pull again. Only the current season keeps pulling live.
+const HISTORICAL_SNAPSHOT_SEASONS = [
+  { season: 2025, league_key: '461.l.45789' },
+  { season: 2024, league_key: '449.l.20860' },
+  { season: 2023, league_key: '423.l.1146108' },
+  { season: 2022, league_id: '1171203' },
+];
+
+app.get('/api/historical-snapshot', async (req, res) => {
+  try {
+    const allScoresFull = await computeAllScores();
+    const allScores = allScoresFull.filter((m) => m.season !== 2026);
+
+    const seasons = {};
+    for (const s of HISTORICAL_SNAPSHOT_SEASONS) {
+      try {
+        seasons[s.season] = await fetchSeasonDetail(s);
+      } catch (e) {
+        seasons[s.season] = { error: e.message };
+      }
+    }
+
+    const playerStats = playerStatsJob.status === 'done' && playerStatsJob.data
+      ? playerStatsJob.data.filter((pw) => pw.season !== 2026)
+      : null;
+
+    const snapshot = {
+      generatedAt: new Date().toISOString(),
+      allScores,
+      seasons,
+      playerStats,
+      playerStatsNote: playerStats ? null : 'Team Stats job hasn\u2019t been run yet this session \u2014 run it first (Record Book \u2192 Team Stats \u2192 Start Loading Team Stats), then refetch this endpoint to include it.',
+    };
+
+    res.setHeader('Content-Disposition', 'attachment; filename="mehrob-mania-historical-snapshot.json"');
+    res.setHeader('Content-Type', 'application/json');
+    res.send(JSON.stringify(snapshot));
+  } catch (err) {
+    console.error('Historical snapshot failed:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Failed to build historical snapshot.' });
+  }
 });
 
 app.get('/', (req, res) => {
