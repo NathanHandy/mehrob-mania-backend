@@ -255,7 +255,7 @@ app.get('/api/schedule', async (req, res) => {
 });
 
 async function fetchDraftWithNames(leagueKey) {
-  const draftData = await yahooGet(`league/${leagueKey}/draftresults`);
+  const draftData = await yahooGetWithRetry(`league/${leagueKey}/draftresults`);
   const resultsObj = draftData?.fantasy_content?.league?.[1]?.draft_results || {};
   const playerKeys = Object.keys(resultsObj)
     .filter((k) => k !== 'count')
@@ -264,7 +264,7 @@ async function fetchDraftWithNames(leagueKey) {
   const playerNames = {};
   for (let i = 0; i < playerKeys.length; i += 25) {
     const chunk = playerKeys.slice(i, i + 25);
-    const playersData = await yahooGet(`league/${leagueKey}/players;player_keys=${chunk.join(',')}`);
+    const playersData = await yahooGetWithRetry(`league/${leagueKey}/players;player_keys=${chunk.join(',')}`);
     const playersObj = playersData?.fantasy_content?.league?.[1]?.players || {};
     Object.keys(playersObj).forEach((k) => {
       if (k === 'count') return;
@@ -365,7 +365,7 @@ async function fetchSeasonDetail({ league_key, league_id, season }) {
     leagueKey = `${gameKey}.l.${league_id}`;
   }
 
-  const standings = await yahooGet(`league/${leagueKey}/standings`);
+  const standings = await yahooGetWithRetry(`league/${leagueKey}/standings`);
   let draft = null;
   try {
     draft = await fetchDraftWithNames(leagueKey);
@@ -375,7 +375,7 @@ async function fetchSeasonDetail({ league_key, league_id, season }) {
 
   let transactions = null;
   try {
-    transactions = await yahooGet(`league/${leagueKey}/transactions`);
+    transactions = await yahooGetWithRetry(`league/${leagueKey}/transactions`);
   } catch (e) {
     // Same deal — transactions might not be pullable for very old leagues.
   }
@@ -444,7 +444,7 @@ async function computeAllScores() {
 
     let maxWeek = 17;
     try {
-      const standingsData = await yahooGet(`league/${leagueKey}/standings`);
+      const standingsData = await yahooGetWithRetry(`league/${leagueKey}/standings`);
       const leagueMeta = standingsData?.fantasy_content?.league?.[0];
       if (leagueMeta) {
         maxWeek = Number(leagueMeta.is_finished ? (leagueMeta.end_week || 17) : (leagueMeta.current_week || 1));
@@ -453,7 +453,7 @@ async function computeAllScores() {
 
     for (let week = 1; week <= maxWeek; week++) {
       try {
-        const data = await yahooGet(`league/${leagueKey}/scoreboard;week=${week}`);
+        const data = await yahooGetWithRetry(`league/${leagueKey}/scoreboard;week=${week}`);
         const matchupsObj = data?.fantasy_content?.league?.[1]?.scoreboard?.[0]?.matchups;
         if (!matchupsObj) continue;
         Object.keys(matchupsObj).forEach((key) => {
